@@ -1,0 +1,19 @@
+# Sample WIFs for testing walletdat_forge.py / wif_combo_import_via_rpc.py
+#
+# These are the textbook "toy" private keys 1, 2 and 3 (scalar = 0x01,
+# 0x02, 0x03 on the secp256k1 curve), encoded as compressed mainnet WIFs.
+# They are about as public and non-secret as a Bitcoin private key can
+# possibly be - private key = 1 corresponds to the generator point itself
+# and shows up in more tutorials, CTFs and "don't send funds here" address
+# lists than any other key in existence.
+#
+# DO NOT use these for anything beyond testing this tool's output. Any
+# funds ever sent to the addresses derived from these keys should be
+# assumed permanently, publicly spendable by anyone on earth.
+#
+# privkey = 1
+KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn
+# privkey = 2
+KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU74NMTptX4
+# privkey = 3
+KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU74sHUHy8S

@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.dat
+*.dat-journal
+*.errors.txt
