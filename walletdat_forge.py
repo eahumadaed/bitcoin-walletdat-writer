@@ -39,11 +39,15 @@ keys, so the whole pipeline never depends on bitcoind or any third-party
 crypto library.
 """
 import argparse
+import functools
 import hashlib
+import itertools
+import multiprocessing as mp
 import os
 import struct
 import sqlite3
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
 from key import ECKey  # noqa: E402  (vendor/key.py, from bitcoin/bitcoin test framework)
@@ -163,12 +167,18 @@ def db_key(name, *fixed_width_parts):
     return out
 
 
-# SEC1 ECPrivateKey DER template (RFC 5915 / SEC1 sec 3, explicit secp256k1
-# curve parameters). This blob is IDENTICAL for every key except two spots:
-# the 32-byte private scalar and the 33-byte compressed public key point -
-# confirmed by diffing the DER output for two different real keys.
-DER_HEADER = bytes.fromhex("3081d30201010420")
-DER_MIDDLE = bytes.fromhex(
+# SEC1 ECPrivateKey DER templates (RFC 5915 / SEC1 sec 3, explicit secp256k1
+# curve parameters). Each blob is IDENTICAL for every key of the same
+# compression type except two spots: the 32-byte private scalar and the
+# public key point (33 bytes compressed / 65 bytes uncompressed) -
+# confirmed by diffing the DER output for multiple different real keys of
+# each type. The uncompressed variant is bigger only because DER's
+# explicit-curve-parameters section embeds the generator point G in the
+# same compression as the key's own public key, plus the outer SEQUENCE
+# length prefix grows from short-form (1 byte) to long-form (2 bytes)
+# once the total exceeds 255 bytes.
+DER_HEADER_COMPRESSED = bytes.fromhex("3081d30201010420")
+DER_MIDDLE_COMPRESSED = bytes.fromhex(
     "a08185308182020101302c06072a8648ce3d0101022100"
     "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f"
     "300604010004010704210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
@@ -176,9 +186,26 @@ DER_MIDDLE = bytes.fromhex(
     "01a124032200"
 )
 
+DER_HEADER_UNCOMPRESSED = bytes.fromhex("308201130201010420")
+DER_MIDDLE_UNCOMPRESSED = bytes.fromhex(
+    "a081a53081a2020101302c06072a8648ce3d0101022100"
+    "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f"
+    "3006040100040107044104"
+    "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8"
+    "022100fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141020101"
+    "a1440342"
+    "00"
+)
 
-def build_der(privkey32, pubkey33):
-    return DER_HEADER + privkey32 + DER_MIDDLE + pubkey33
+
+def build_der(privkey32, pubkey, compressed):
+    if compressed:
+        assert len(pubkey) == 33
+        return DER_HEADER_COMPRESSED + privkey32 + DER_MIDDLE_COMPRESSED + pubkey
+    else:
+        assert len(pubkey) == 65
+        return DER_HEADER_UNCOMPRESSED + privkey32 + DER_MIDDLE_UNCOMPRESSED + pubkey
 
 
 # "Blank wallet" scaffolding records. These are identical across every
@@ -199,21 +226,27 @@ SQLITE_APPLICATION_ID = -104942375
 
 
 def build_combo_records(wif, timestamp=1):
-    """Build the (walletdescriptor, walletdescriptorkey) row pair for one WIF."""
+    """Build the (walletdescriptor, walletdescriptorkey) row pair for one WIF.
+
+    Handles both compressed (33-byte pubkey) and uncompressed (65-byte
+    pubkey) WIFs - common in older/legacy wallets, where WIFs starting
+    with '5' are uncompressed and 'K'/'L' are compressed. combo() only
+    expands to pk()/pkh() for an uncompressed key (wpkh()/sh(wpkh())
+    require a compressed pubkey per consensus rules), which Core handles
+    on its own - this tool doesn't need to know or care about that.
+    """
     privkey32, compressed = wif_to_privkey(wif)
-    if not compressed:
-        raise ValueError("only compressed WIFs are supported")
 
     key = ECKey()
-    key.set(privkey32, compressed=True)
-    pubkey33 = key.get_pubkey().get_bytes()
+    key.set(privkey32, compressed=compressed)
+    pubkey = key.get_pubkey().get_bytes()
 
-    desc_plain = f"combo({pubkey33.hex()})"
+    desc_plain = f"combo({pubkey.hex()})"
     desc_full = descsum_create(desc_plain)
     desc_id = hashlib.sha256(desc_full.encode()).digest()
 
-    der = build_der(privkey32, pubkey33)
-    key_value = compact_size(len(der)) + der + chash256(pubkey33 + der)
+    der = build_der(privkey32, pubkey, compressed)
+    key_value = compact_size(len(der)) + der + chash256(pubkey + der)
 
     desc_value = (
         ser_string(desc_full.encode())
@@ -227,33 +260,126 @@ def build_combo_records(wif, timestamp=1):
         (db_key("walletdescriptor", desc_id), desc_value),
         # CPubKey serializes as compactsize(len)+bytes, unlike the fixed-width
         # uint256 desc_id - this asymmetry is a common trap, see README.
-        (db_key("walletdescriptorkey", desc_id, ser_string(pubkey33)), key_value),
+        (db_key("walletdescriptorkey", desc_id, ser_string(pubkey)), key_value),
     ], desc_full
 
 
-def write_wallet(out_path, wifs, timestamp=1):
-    if os.path.exists(out_path):
-        os.remove(out_path)
-    con = sqlite3.connect(out_path)
-    con.execute("CREATE TABLE main(key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL)")
-    con.execute(f"PRAGMA application_id = {SQLITE_APPLICATION_ID}")
-    con.execute("PRAGMA user_version = 0")
+# ---------------------------------------------------------------------------
+# streaming, parallel wallet construction
+#
+# Pubkey derivation (pure-Python secp256k1 point multiplication, see
+# vendor/) is the actual bottleneck here, not SQLite - measured at ~135
+# keys/s on a single core. Two things keep this practical at scale:
+#
+#   1. multiprocessing spreads derivation across all CPU cores. Only the
+#      derivation happens in worker processes; SQLite writes stay on a
+#      single connection in the main process (SQLite doesn't want
+#      concurrent writers anyway, and this isn't the slow part).
+#   2. WIFs are read lazily and processed in fixed-size chunks, each
+#      chunk's rows get INSERTed and committed, then dropped - so memory
+#      use stays bounded by (chunk_size * a few in-flight chunks), not by
+#      the total input size. Without this, building one Python list with
+#      every row for a very large input can use far more RAM than the
+#      resulting SQLite file itself.
+# ---------------------------------------------------------------------------
 
-    rows = [(db_key(name), val) for name, val in CONST_RECORDS.items()]
-
-    ok, errors = 0, []
-    for wif in wifs:
+def _process_chunk(wifs_chunk, timestamp):
+    """Runs in a worker process: derive pubkeys/records for one chunk of WIFs."""
+    rows, errors = [], []
+    for wif in wifs_chunk:
         try:
             recs, _desc = build_combo_records(wif, timestamp=timestamp)
             rows.extend(recs)
-            ok += 1
         except Exception as e:
             errors.append((wif, str(e)))
+    return rows, errors
 
-    con.executemany("INSERT INTO main(key, value) VALUES (?, ?)", rows)
-    con.commit()
+
+def chunked(iterable, size):
+    it = iter(iterable)
+    while True:
+        chunk = list(itertools.islice(it, size))
+        if not chunk:
+            return
+        yield chunk
+
+
+def write_wallet(out_path, wifs_iter, timestamp=1, chunk_size=100_000, workers=None,
+                  unsafe_fast=False, append=False):
+    """
+    wifs_iter: an iterable (generator is fine and recommended) of WIF strings.
+    workers: number of worker processes for pubkey derivation. 1 disables
+             multiprocessing entirely (useful for debugging). Defaults to
+             all available CPU cores.
+    unsafe_fast: relax SQLite's durability guarantees (WAL + synchronous=OFF)
+             for maximum write throughput. Fine for a disposable stress test;
+             do NOT use this for a wallet.dat you intend to keep - a crash
+             or power loss mid-write can leave it corrupted.
+    append: add keys to an EXISTING wallet.dat (forge-built or Core-built -
+             the schema is the same either way) instead of creating a fresh
+             one. The scaffolding/constant records are skipped (they should
+             already be there), and every INSERT uses OR IGNORE, so it's
+             safe to re-run over a WIF list that partially overlaps with
+             what's already in the file - already-present keys are silently
+             skipped rather than raising a constraint error. Useful for
+             resuming an interrupted run, or for topping up a wallet that
+             was originally built by a different tool/path.
+             NOTE: the target file must not be open elsewhere (e.g. loaded
+             in a running bitcoind) - SQLite's exclusive locking will
+             reject concurrent access either way.
+    """
+    insert_sql = "INSERT OR IGNORE INTO main(key, value) VALUES (?, ?)" if append \
+        else "INSERT INTO main(key, value) VALUES (?, ?)"
+
+    if append:
+        if not os.path.exists(out_path):
+            raise FileNotFoundError(f"--append requires an existing file: {out_path}")
+        con = sqlite3.connect(out_path)
+    else:
+        if os.path.exists(out_path):
+            os.remove(out_path)
+        con = sqlite3.connect(out_path)
+        con.execute("CREATE TABLE main(key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL)")
+        con.execute(f"PRAGMA application_id = {SQLITE_APPLICATION_ID}")
+        con.execute("PRAGMA user_version = 0")
+        const_rows = [(db_key(name), val) for name, val in CONST_RECORDS.items()]
+        con.executemany(insert_sql, const_rows)
+        con.commit()
+
+    if unsafe_fast:
+        con.execute("PRAGMA journal_mode = WAL")
+        con.execute("PRAGMA synchronous = OFF")
+
+    workers = workers or os.cpu_count() or 1
+    worker_fn = functools.partial(_process_chunk, timestamp=timestamp)
+    chunk_iter = chunked(wifs_iter, chunk_size)
+
+    total_ok, total_err = 0, 0
+    error_log = []
+    t0 = time.time()
+
+    pool = mp.Pool(workers) if workers > 1 else None
+    results_iter = pool.imap(worker_fn, chunk_iter) if pool else map(worker_fn, chunk_iter)
+
+    try:
+        for rows, errors in results_iter:
+            if rows:
+                con.executemany(insert_sql, rows)
+                con.commit()
+            # 2 DB rows per successfully-processed key
+            total_ok += len(rows) // 2
+            total_err += len(errors)
+            error_log.extend(errors)
+            elapsed = time.time() - t0
+            rate = total_ok / elapsed if elapsed > 0 else 0
+            print(f"  {total_ok} keys written, {total_err} errors  ({rate:.0f} keys/s, {elapsed:.0f}s elapsed)")
+    finally:
+        if pool:
+            pool.close()
+            pool.join()
+
     con.close()
-    return ok, errors
+    return total_ok, error_log
 
 
 def read_wifs(path):
@@ -269,7 +395,16 @@ def main():
         description="Build a Bitcoin Core-compatible wallet.dat from a list of WIFs, without bitcoind."
     )
     ap.add_argument("--in", dest="infile", required=True, help="text file, one WIF per line")
-    ap.add_argument("--out", dest="outfile", required=True, help="output wallet.dat path")
+    ap.add_argument("--out", dest="outfile", required=True,
+                     help="output path. By default this is the wallet.dat file itself. "
+                          "With --as-dir, it's treated as a wallet name/directory instead.")
+    ap.add_argument(
+        "--as-dir", action="store_true",
+        help="treat --out as a wallet directory name rather than a literal wallet.dat "
+             "path: creates <out>/ (if it doesn't exist yet) and writes <out>/wallet.dat "
+             "inside it - the same layout Bitcoin Core itself uses for a wallet, so the "
+             "result can be copied straight into <datadir>/wallets/ and loaded by name.",
+    )
     ap.add_argument(
         "--timestamp", type=int, default=1,
         help="descriptor creation_time (unix epoch). Default 1 = 'unknown origin', "
@@ -277,14 +412,52 @@ def main():
              "beginning of the chain. Use a real epoch value if you know these "
              "keys have no history and want to skip scanning for it.",
     )
+    ap.add_argument(
+        "--workers", type=int, default=None,
+        help="number of worker processes for pubkey derivation (default: all CPU cores). "
+             "Pass 1 to disable multiprocessing.",
+    )
+    ap.add_argument(
+        "--chunk-size", type=int, default=100_000,
+        help="how many keys to derive and write per batch (default: 100000). "
+             "Controls the memory/throughput trade-off - keeps memory use bounded "
+             "regardless of total input size, since each chunk is written to SQLite "
+             "and discarded before the next one starts.",
+    )
+    ap.add_argument(
+        "--unsafe-fast", action="store_true",
+        help="relax SQLite durability (WAL + synchronous=OFF) for max throughput on "
+             "disposable stress tests. Do NOT use for a wallet.dat you intend to keep.",
+    )
+    ap.add_argument(
+        "--append", action="store_true",
+        help="add keys to an EXISTING wallet.dat instead of creating a fresh one. "
+             "Already-present keys are silently skipped (safe to resume/re-run). "
+             "The target file must not be loaded in a running bitcoind.",
+    )
     args = ap.parse_args()
 
-    wifs = list(read_wifs(args.infile))
-    ok, errors = write_wallet(args.outfile, wifs, timestamp=args.timestamp)
-    print(f"=== {args.outfile}: {ok}/{len(wifs)} keys written ===")
-    for wif, err in errors:
-        print(f"  error on {wif[:10]}...: {err}")
+    outfile = args.outfile
+    if args.as_dir:
+        os.makedirs(outfile, exist_ok=True)
+        outfile = os.path.join(outfile, "wallet.dat")
+
+    ok, errors = write_wallet(
+        outfile,
+        read_wifs(args.infile),
+        timestamp=args.timestamp,
+        chunk_size=args.chunk_size,
+        workers=args.workers,
+        unsafe_fast=args.unsafe_fast,
+        append=args.append,
+    )
+    print(f"=== {outfile}: {ok} keys written, {len(errors)} errors ===")
     if errors:
+        err_path = args.infile + ".errors.txt"
+        with open(err_path, "w") as f:
+            for wif, err in errors:
+                f.write(f"{wif}\t{err}\n")
+        print(f"error detail written to: {err_path}")
         sys.exit(1)
 
 

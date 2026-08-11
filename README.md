@@ -91,24 +91,39 @@ depends on `bitcoind`, OpenSSL, or any third-party crypto library.
 python3 walletdat_forge.py --in wifs.txt --out wallet.dat
 ```
 
-`wifs.txt`: one compressed mainnet WIF per line, blank lines and `#`
-comments ignored (see [`samples/fake_wifs.txt`](samples/fake_wifs.txt)).
+`wifs.txt`: one WIF per line (compressed or uncompressed - both are
+supported), blank lines and `#` comments ignored (see
+[`samples/fake_wifs.txt`](samples/fake_wifs.txt)).
 
-Then, to actually use it, drop the file into a real node's wallet
-directory and load it:
+Pass `--as-dir` to have it create the wallet *directory* Core itself
+expects, ready to drop straight into `<datadir>/wallets/`:
 
 ```bash
-mkdir -p ~/.bitcoin/wallets/my_wallet
-cp wallet.dat ~/.bitcoin/wallets/my_wallet/wallet.dat
+python3 walletdat_forge.py --in wifs.txt --out my_wallet --as-dir
+# writes my_wallet/wallet.dat (creating my_wallet/ if needed)
+
+cp -r my_wallet ~/.bitcoin/wallets/
 bitcoin-cli loadwallet my_wallet
 bitcoin-cli -rpcwallet=my_wallet rescanblockchain   # if you need on-chain history
 ```
+
+Without `--as-dir`, `--out` is just the literal `wallet.dat` path -
+useful for `--append` (see below), where `--out` points at a
+`wallet.dat` that already exists.
 
 By default every descriptor is stamped with `creation_time = 1`
 ("unknown origin") so a later `rescanblockchain` searches from the very
 start of the chain — appropriate if these keys might have real history
 you want recovered. Pass `--timestamp <unix_time>` if you know better
 (e.g. these keys were never used, so there's nothing to scan for).
+
+For large inputs, pubkey derivation (not SQLite) is the bottleneck -
+`--workers N` spreads it across CPU cores (default: all of them), and
+`--chunk-size N` (default 100000) bounds memory use by writing and
+discarding each batch as it's derived, regardless of total input size.
+`--append` adds keys to an existing wallet.dat instead of creating a
+fresh one - already-present keys are silently skipped, so it's safe to
+resume an interrupted run or top up a wallet built some other way.
 
 ### `wif_combo_import_via_rpc.py` — via a running node
 
