@@ -304,6 +304,17 @@ def chunked(iterable, size):
         yield chunk
 
 
+def default_chunk_size(total, workers):
+    """Aim for enough chunks that progress logs update steadily (~20 per
+    worker over the whole run) without going so small that per-chunk
+    overhead (pickling to a worker, a SQLite commit) starts to matter."""
+    if not total:
+        return 100_000
+    target_chunks = max(workers * 20, 20)
+    size = total // target_chunks
+    return max(500, min(size, 100_000))
+
+
 def format_hms(seconds):
     seconds = max(0, int(seconds))
     h, rem = divmod(seconds, 3600)
@@ -439,11 +450,13 @@ def main():
              "Pass 1 to disable multiprocessing.",
     )
     ap.add_argument(
-        "--chunk-size", type=int, default=100_000,
-        help="how many keys to derive and write per batch (default: 100000). "
-             "Controls the memory/throughput trade-off - keeps memory use bounded "
-             "regardless of total input size, since each chunk is written to SQLite "
-             "and discarded before the next one starts.",
+        "--chunk-size", type=int, default=None,
+        help="how many keys to derive and write per batch. Controls the memory/"
+             "throughput trade-off, AND how often a progress line is printed - each "
+             "chunk is written to SQLite (and a progress line logged) before the next "
+             "one starts. Default: auto-picked from the input size and worker count so "
+             "you get a steady stream of updates instead of one line at the very end "
+             "(capped at 100000). Set this explicitly to override that.",
     )
     ap.add_argument(
         "--unsafe-fast", action="store_true",
@@ -481,11 +494,15 @@ def main():
         total = sum(1 for _ in read_wifs(args.infile))
         print(f"{total} WIFs to process")
 
+    workers_effective = args.workers or os.cpu_count() or 1
+    chunk_size = args.chunk_size or default_chunk_size(total, workers_effective)
+    print(f"using chunk-size={chunk_size}, workers={workers_effective}")
+
     ok, errors = write_wallet(
         outfile,
         read_wifs(args.infile),
         timestamp=args.timestamp,
-        chunk_size=args.chunk_size,
+        chunk_size=chunk_size,
         workers=args.workers,
         unsafe_fast=args.unsafe_fast,
         append=args.append,
