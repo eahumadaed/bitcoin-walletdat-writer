@@ -304,13 +304,24 @@ def chunked(iterable, size):
         yield chunk
 
 
+def format_hms(seconds):
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h{m:02d}m{s:02d}s" if h else f"{m}m{s:02d}s"
+
+
 def write_wallet(out_path, wifs_iter, timestamp=1, chunk_size=100_000, workers=None,
-                  unsafe_fast=False, append=False):
+                  unsafe_fast=False, append=False, total=None):
     """
     wifs_iter: an iterable (generator is fine and recommended) of WIF strings.
     workers: number of worker processes for pubkey derivation. 1 disables
              multiprocessing entirely (useful for debugging). Defaults to
              all available CPU cores.
+    total: total number of WIFs in wifs_iter, if known - enables a percent-
+           complete and ETA in the progress log. Pass None to skip counting
+           ahead of time (e.g. for a WIF source that isn't a plain file) and
+           get plain running totals instead.
     unsafe_fast: relax SQLite's durability guarantees (WAL + synchronous=OFF)
              for maximum write throughput. Fine for a disposable stress test;
              do NOT use this for a wallet.dat you intend to keep - a crash
@@ -318,18 +329,19 @@ def write_wallet(out_path, wifs_iter, timestamp=1, chunk_size=100_000, workers=N
     append: add keys to an EXISTING wallet.dat (forge-built or Core-built -
              the schema is the same either way) instead of creating a fresh
              one. The scaffolding/constant records are skipped (they should
-             already be there), and every INSERT uses OR IGNORE, so it's
-             safe to re-run over a WIF list that partially overlaps with
-             what's already in the file - already-present keys are silently
-             skipped rather than raising a constraint error. Useful for
-             resuming an interrupted run, or for topping up a wallet that
-             was originally built by a different tool/path.
+             already be there). Useful for resuming an interrupted run, or
+             for topping up a wallet that was originally built by a
+             different tool/path.
              NOTE: the target file must not be open elsewhere (e.g. loaded
              in a running bitcoind) - SQLite's exclusive locking will
              reject concurrent access either way.
     """
-    insert_sql = "INSERT OR IGNORE INTO main(key, value) VALUES (?, ?)" if append \
-        else "INSERT INTO main(key, value) VALUES (?, ?)"
+    # Always OR IGNORE, append or not: the same WIF can legitimately appear
+    # more than once in one input file (duplicate exports, overlapping
+    # sources), which produces the same key/value pair twice - a plain
+    # INSERT would crash on the second copy with a UNIQUE constraint error
+    # instead of just skipping a harmless, byte-identical duplicate.
+    insert_sql = "INSERT OR IGNORE INTO main(key, value) VALUES (?, ?)"
 
     if append:
         if not os.path.exists(out_path):
@@ -371,8 +383,17 @@ def write_wallet(out_path, wifs_iter, timestamp=1, chunk_size=100_000, workers=N
             total_err += len(errors)
             error_log.extend(errors)
             elapsed = time.time() - t0
-            rate = total_ok / elapsed if elapsed > 0 else 0
-            print(f"  {total_ok} keys written, {total_err} errors  ({rate:.0f} keys/s, {elapsed:.0f}s elapsed)")
+            done = total_ok + total_err
+            rate = done / elapsed if elapsed > 0 else 0
+            if total:
+                pct = 100 * done / total
+                remaining = max(0, total - done)
+                eta = format_hms(remaining / rate) if rate > 0 else "?"
+                print(f"  {done}/{total} ({pct:.1f}%)  {total_ok} written, {total_err} errors  "
+                      f"| {rate:.0f} keys/s | elapsed {format_hms(elapsed)} | ETA {eta}")
+            else:
+                print(f"  {total_ok} keys written, {total_err} errors  "
+                      f"| {rate:.0f} keys/s | elapsed {format_hms(elapsed)}")
     finally:
         if pool:
             pool.close()
@@ -435,12 +456,30 @@ def main():
              "Already-present keys are silently skipped (safe to resume/re-run). "
              "The target file must not be loaded in a running bitcoind.",
     )
+    ap.add_argument(
+        "--no-count", action="store_true",
+        help="skip the upfront pass that counts total WIFs in the input file (used for "
+             "the percent-complete/ETA in progress logs). Only useful if --in isn't a "
+             "plain file the tool can cheaply scan twice.",
+    )
     args = ap.parse_args()
+
+    # Line-buffer stdout so progress lines show up as they're printed instead
+    # of sitting in a buffer until the process exits (only matters when
+    # stdout is redirected to a file/pipe, e.g. `> run.log &` - a TTY is
+    # already line-buffered by default).
+    sys.stdout.reconfigure(line_buffering=True)
 
     outfile = args.outfile
     if args.as_dir:
         os.makedirs(outfile, exist_ok=True)
         outfile = os.path.join(outfile, "wallet.dat")
+
+    total = None
+    if not args.no_count:
+        print(f"counting {args.infile}...")
+        total = sum(1 for _ in read_wifs(args.infile))
+        print(f"{total} WIFs to process")
 
     ok, errors = write_wallet(
         outfile,
@@ -450,6 +489,7 @@ def main():
         workers=args.workers,
         unsafe_fast=args.unsafe_fast,
         append=args.append,
+        total=total,
     )
     print(f"=== {outfile}: {ok} keys written, {len(errors)} errors ===")
     if errors:
