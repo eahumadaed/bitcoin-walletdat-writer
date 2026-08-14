@@ -211,3 +211,12 @@ MIT — see [LICENSE](LICENSE). `vendor/key.py` and `vendor/secp256k1.py`
 are copyright the Bitcoin Core developers / Pieter Wuille, also MIT
 licensed (see their file headers) — see the notes at the top of each
 file for what, if anything, was changed from upstream.
+
+## Support
+
+If this project saved you time, rescued a late-night debugging session, or made your server behave for once, you can invite me a coffee:
+
+- [GitHub Sponsors](https://github.com/sponsors/eahumadaed)
+- [Ko-fi](https://ko-fi.com/edinsonahumada)
+
+No pressure, just caffeine-powered open source.
